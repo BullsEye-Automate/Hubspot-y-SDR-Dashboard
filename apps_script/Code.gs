@@ -259,10 +259,9 @@ function getPendingMeetings(ss) {
   const meetings = [];
 
   for (let i = 1; i < all.length; i++) {
-    const r         = all[i];
-    const realizado = colRealizado >= 0
-      ? r[colRealizado]?.toString().trim().toLowerCase()
-      : "";
+    const r             = all[i];
+    const realizadoRaw  = colRealizado >= 0 ? r[colRealizado]?.toString().trim() : "";
+    const realizado     = realizadoRaw.toLowerCase();
 
     if (!pendingValues.includes(realizado)) continue;
 
@@ -276,7 +275,9 @@ function getPendingMeetings(ss) {
       pais:      colPais        >= 0 ? r[colPais]?.toString().trim()        : "",
       fecha:     colFecha       >= 0 ? _cellDate(r[colFecha])              : "",
       hora:      colHora        >= 0 ? r[colHora]?.toString().trim()        : "",
-      estado:    realizado,
+      // Se preserva el valor original (no en minúsculas) porque el formulario
+      // compara "estado" contra los literales exactos de sus <option value>.
+      estado:    realizadoRaw,
       propuesta: colPropuesta   >= 0 ? r[colPropuesta]?.toString().trim()   : "",
     });
   }

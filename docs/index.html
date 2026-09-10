@@ -948,10 +948,17 @@ function renderMeetings(meetings) {
         <div class="field">
           <label>Estado</label>
           <select id="est-${i}" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);font-family:inherit;font-size:14px;padding:10px 14px;outline:none;width:100%;appearance:none;">
-            <option value="Pendiente"  ${m.estado==="Pendiente"  ? "selected":""}>⏳ Pendiente</option>
-            <option value="Si"         ${m.estado==="Si"||m.estado==="Sí" ? "selected":""}>✅ Realizada</option>
-            <option value="No"         ${m.estado==="No"         ? "selected":""}>❌ No realizada</option>
-            <option value="Reagendar"  ${m.estado==="Reagendar"  ? "selected":""}>🔄 Reagendar</option>
+            ${(() => {
+              // Comparación insensible a mayúsculas/minúsculas y sin tildes:
+              // el Excel puede traer "no", "No", "NO", "sí", "si", etc.
+              const est = (m.estado || "").toLowerCase().trim();
+              const sel = (vals) => vals.includes(est) ? "selected" : "";
+              return `
+            <option value="Pendiente"  ${sel(["pendiente", ""])}>⏳ Pendiente</option>
+            <option value="Si"         ${sel(["si", "sí"])}>✅ Realizada</option>
+            <option value="No"         ${sel(["no"])}>❌ No realizada</option>
+            <option value="Reagendar"  ${sel(["reagendar"])}>🔄 Reagendar</option>`;
+            })()}
           </select>
         </div>
         <div class="field" style="grid-column:1/-1">
@@ -1022,6 +1029,16 @@ async function updateMeeting(idx, rowNum) {
         propuesta: propuesta,
       })
     });
+    // Reflejar el cambio en la copia local para que, si el SDR vuelve a esta
+    // lista sin recargar la página, ya no vea el estado viejo ("Pendiente").
+    const meeting = allMeetings.find(m => m.row === rowNum);
+    if (meeting) {
+      meeting.fecha     = fecha;
+      meeting.hora      = hora;
+      meeting.estado    = estado;
+      meeting.propuesta = propuesta;
+    }
+
     status.textContent = "✅ Actualizado correctamente";
     status.className = "update-status ok";
     document.getElementById(`mc-${idx}`).classList.add("updated");
