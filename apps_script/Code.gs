@@ -21,6 +21,7 @@ const CACHE_TTL          = 300; // 5 minutos
 // Columnas del sheet de salida
 const OUTPUT_HEADERS = [
   "Cliente",
+  "ID Cliente",
   "Origen",
   "Responsable",
   "Empresa",
@@ -83,7 +84,8 @@ function doGet(e) {
 
     // Cachear meta y meetings con chunking para evitar límite 100KB de CacheService
     const metaOnly = { clientes: data.clientes, sdrs: data.sdrs, origenes: data.origenes,
-                       paises: data.paises, industrias: data.industrias, propuestas: data.propuestas };
+                       paises: data.paises, industrias: data.industrias, propuestas: data.propuestas,
+                       clientesMap: data.clientesMap };
     cachePut(cache, CACHE_KEY_META,     JSON.stringify(metaOnly),  CACHE_TTL);
     cachePut(cache, CACHE_KEY_MEETINGS, JSON.stringify(meetings),  CACHE_TTL);
 
@@ -140,8 +142,11 @@ function getMaestraData(ss) {
   const colOrigen    = idx("origen");
   const colPais      = headers.findIndex(h => /pa[íi]s/i.test(h));
   const colIndustria = idx("industria");
+  const colIdCliente = headers.findIndex(h =>
+    h.toLowerCase().includes("id") && h.toLowerCase().includes("cliente")
+  );
 
-  const result = { clientes:[], sdrs:[], origenes:[], paises:[], industrias:[], propuestas:[] };
+  const result = { clientes:[], sdrs:[], origenes:[], paises:[], industrias:[], propuestas:[], clientesMap:{} };
   const seen   = {
     clientes:   new Set(),
     sdrs:       new Set(),
@@ -159,6 +164,8 @@ function getMaestraData(ss) {
     if (cliente && stCliente === "activo" && !seen.clientes.has(cliente)) {
       result.clientes.push(cliente);
       seen.clientes.add(cliente);
+      const idCliente = colIdCliente >= 0 ? val(colIdCliente) : "";
+      if (idCliente) result.clientesMap[cliente] = idCliente;
     }
 
     const sdr   = val(colResponsable);
@@ -305,10 +312,14 @@ function saveReunion(p) {
     new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm:ss"
   );
 
+  const clientesMap = getMaestraData(ss).clientesMap; // Cliente -> ID Cliente (misma fuente que tu BUSCARV)
+
   // Matching flexible por header (tolera variaciones de nombre)
   function valueForHeader(h) {
     const hl = h.toString().toLowerCase().trim();
     if (hl === "cliente")                                        return p.cliente            || "";
+    if (hl.includes("id") && hl.includes("cliente"))            return p.id_cliente || clientesMap[p.cliente] || "";
+    if (hl.includes("id") && hl.includes("reuni"))              return Utilities.getUuid();
     if (hl === "origen")                                         return p.origen             || "";
     if (hl.includes("responsable"))                              return p.responsable        || "";
     // empresa debe ir ANTES de contacto: "Empresa del contacto" contiene "contacto"
@@ -339,6 +350,24 @@ function saveReunion(p) {
   const row = sheetHeaders.map(h => valueForHeader(h));
 
   sheet.appendRow(row);
+}
+
+// Ejecutar UNA SOLA VEZ manualmente (seleccionarla en el desplegable de
+// funciones, arriba al lado de "Depurar", y apretar "Ejecutar") para
+// rellenar con un ID aleatorio las reuniones que ya existían antes de
+// agregar la columna "ID Reunión".
+function backfillMeetingIds() {
+  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(OUTPUT_TAB);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const idCol = headers.findIndex(h => h.toString().trim() === "ID Reunión") + 1;
+  if (idCol === 0) throw new Error('No encontré la columna "ID Reunión" — agregala primero en la hoja.');
+
+  const lastRow = sheet.getLastRow();
+  for (let r = 2; r <= lastRow; r++) {
+    const cell = sheet.getRange(r, idCol);
+    if (!cell.getValue()) cell.setValue(Utilities.getUuid());
+  }
 }
 
 // ── Obtener clientes únicos con reuniones pendientes para un SDR ──────────
