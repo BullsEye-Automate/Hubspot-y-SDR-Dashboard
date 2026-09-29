@@ -601,7 +601,7 @@
 const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyRbG9TwFZI3l4arrTsDerZTH05GabWJ2e_bOOKWbrSuowa1D50tHM6UO1LiSmHiN99/exec";
 
 // IDs de selects que tendrán búsqueda (Tom Select)
-const SEARCHABLE_SELECTS = ["s-cliente", "s-sdr", "s-origen", "s-pais", "s-industria"];
+const SEARCHABLE_SELECTS = ["s-cliente", "s-sdr", "s-origen", "s-pais", "s-industria", "s-hora"];
 const tomInstances = {};
 
 // Cache de reuniones pendientes (cargadas al inicio)
@@ -639,7 +639,7 @@ function initDatePickers() {
 function initTimePicker() {
   const sel = document.getElementById("s-hora");
   for (let h = 7; h <= 22; h++) {
-    for (let m of [0, 30]) {
+    for (let m of [0, 15, 30, 45]) {
       const hh  = String(h).padStart(2,"0");
       const mm  = String(m).padStart(2,"0");
       const suf = h < 12 ? "AM" : "PM";
@@ -647,6 +647,9 @@ function initTimePicker() {
       sel.appendChild(new Option(`${String(h12).padStart(2,"0")}:${mm} ${suf}`, `${hh}:${mm}`));
     }
   }
+  // Se inicializa aquí (y no solo al cargar dropdowns) porque este select
+  // no depende del fetch al Apps Script — ya tiene sus opciones listas.
+  initTomSelect("s-hora");
 }
 
 // ── Tom Select ───────────────────────────────────────────────────────────
@@ -984,7 +987,7 @@ function renderMeetings(meetings) {
     </div>
   `).join("");
 
-  // Init flatpickr on each date input
+  // Init flatpickr on each date input + Tom Select (buscador) en cada hora
   meetings.forEach((m, i) => {
     flatpickr(`#fp-edit-${i}`, {
       locale: "es",
@@ -992,14 +995,15 @@ function renderMeetings(meetings) {
       disableMobile: true,
       defaultDate: m.fecha || null,
     });
+    initTomSelect(`hora-edit-${i}`);
   });
 }
 
-// Genera <option> para select de hora (07:00 → 22:30, cada 30 min)
+// Genera <option> para select de hora (07:00 → 22:45, cada 15 min)
 function buildHoraOptions(selected) {
   let opts = '<option value="">Sin especificar</option>';
   for (let h = 7; h <= 22; h++) {
-    for (let m of [0, 30]) {
+    for (let m of [0, 15, 30, 45]) {
       const hh  = String(h).padStart(2, "0");
       const mm  = String(m).padStart(2, "0");
       const val = `${hh}:${mm}`;
