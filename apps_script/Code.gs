@@ -26,6 +26,7 @@ const OUTPUT_HEADERS = [
   "Responsable",
   "Empresa",
   "Contactos/Correo",
+  "URL Linkedin",
   "Fecha de agendamiento",
   "Fecha de la reunión",
   "Hora",
@@ -325,6 +326,9 @@ function saveReunion(p) {
     // empresa debe ir ANTES de contacto: "Empresa del contacto" contiene "contacto"
     // pero debe mapearse a empresa, no a contactos.
     if (hl.includes("empresa"))                                  return p.empresa            || "";
+    // linkedin debe ir ANTES de contacto: "URL Linkedin del contacto" contiene
+    // "contacto" pero debe mapearse al link, no al nombre.
+    if (hl.includes("linkedin"))                                 return p.linkedin_contacto  || "";
     if (hl.includes("contacto"))                                 return p.contactos          || "";
     if (hl.includes("fecha") && hl.includes("agend"))            return p.fecha_agendamiento || "";
     if (hl.includes("fecha") && hl.includes("reuni"))            return p.fecha_reunion      || "";
