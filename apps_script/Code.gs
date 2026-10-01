@@ -87,8 +87,13 @@ function doGet(e) {
     const metaOnly = { clientes: data.clientes, sdrs: data.sdrs, origenes: data.origenes,
                        paises: data.paises, industrias: data.industrias, propuestas: data.propuestas,
                        clientesMap: data.clientesMap };
-    cachePut(cache, CACHE_KEY_META,     JSON.stringify(metaOnly),  CACHE_TTL);
-    cachePut(cache, CACHE_KEY_MEETINGS, JSON.stringify(meetings),  CACHE_TTL);
+    // No cachear si clientes o sdrs vinieron vacíos: evita que un hiccup puntual
+    // (ej. una lectura que coincide con una edición en curso de "Maestra IA")
+    // quede sirviéndose como respuesta "pegada" durante los 5 minutos de TTL.
+    if (metaOnly.clientes.length > 0 && metaOnly.sdrs.length > 0) {
+      cachePut(cache, CACHE_KEY_META,     JSON.stringify(metaOnly),  CACHE_TTL);
+      cachePut(cache, CACHE_KEY_MEETINGS, JSON.stringify(meetings),  CACHE_TTL);
+    }
 
     return ContentService
       .createTextOutput(JSON.stringify({ status: "ok", data: data }))
