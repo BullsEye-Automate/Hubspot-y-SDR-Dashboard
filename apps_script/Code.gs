@@ -267,6 +267,8 @@ function getPendingMeetings(ss) {
   const colFecha       = col("fecha", "reuni");
   const colHora        = col("hora");
   const colPropuesta   = headers.findIndex(h => h.includes("propuesta") || h.includes("oportunidad"));
+  const colReconf      = headers.indexOf(COL_RECONF.toLowerCase());
+  const colReconfFecha = headers.indexOf(COL_RECONF_FECHA.toLowerCase());
 
   const pendingValues = ["pendiente", "no", "reagendar", ""];
   const meetings = [];
@@ -292,6 +294,8 @@ function getPendingMeetings(ss) {
       // compara "estado" contra los literales exactos de sus <option value>.
       estado:    realizadoRaw,
       propuesta: colPropuesta   >= 0 ? r[colPropuesta]?.toString().trim()   : "",
+      reconfirmada:      colReconf      >= 0 ? _esSi(r[colReconf])               : false,
+      fechaReconfirmada: colReconfFecha >= 0 ? _cellFechaHora(r[colReconfFecha]) : "",
     });
   }
 
@@ -446,6 +450,8 @@ function getMeetingsForSDR(ss, sdrName, clienteFilter) {
   const colHora        = col("hora");
   const colCliente     = col("cliente");
   const colPropuesta   = headers.findIndex(h => h.includes("propuesta") || h.includes("oportunidad"));
+  const colReconf      = headers.indexOf(COL_RECONF.toLowerCase());
+  const colReconfFecha = headers.indexOf(COL_RECONF_FECHA.toLowerCase());
 
   const pendingValues = ["pendiente", "no", "reagendar", ""];
   const meetings      = [];
@@ -474,6 +480,8 @@ function getMeetingsForSDR(ss, sdrName, clienteFilter) {
       estado:    realizado,
       cliente:   colCliente   >= 0 ? r[colCliente]?.toString().trim()   : "",
       propuesta: colPropuesta >= 0 ? r[colPropuesta]?.toString().trim() : "",
+      reconfirmada:      colReconf      >= 0 ? _esSi(r[colReconf])               : false,
+      fechaReconfirmada: colReconfFecha >= 0 ? _cellFechaHora(r[colReconfFecha]) : "",
     });
   }
 
@@ -499,6 +507,12 @@ function updateReunion(p) {
   const colComentario = colIndex("Comentario de la reunión");
   const colPropuesta  = headersL.findIndex(h => h.includes("propuesta") || h.includes("oportunidad"));
 
+  // Fecha/hora antes del cambio: si la reunión se mueve, la reconfirmación
+  // anterior deja de valer (hay que volver a reconfirmar con la nueva fecha).
+  const prevRow = sheet.getRange(rowNum, 1, 1, headers.length).getValues()[0];
+  const fechaAnterior = colFecha >= 0 ? _cellDate(prevRow[colFecha]) : "";
+  const horaAnterior  = colHora  >= 0 ? _cellHora(prevRow[colHora])  : "";
+
   if (colFecha >= 0 && p.fecha_reunion !== undefined) {
     sheet.getRange(rowNum, colFecha + 1).setValue(p.fecha_reunion);
   }
@@ -513,6 +527,14 @@ function updateReunion(p) {
   }
   if (colPropuesta >= 0 && p.propuesta !== undefined) {
     sheet.getRange(rowNum, colPropuesta + 1).setValue(p.propuesta);
+  }
+
+  // ── Reconfirmación ──────────────────────────────────────────────────────
+  if (p.reconfirmada !== undefined) {
+    const seMovio =
+      (p.fecha_reunion !== undefined && p.fecha_reunion !== "" && p.fecha_reunion !== fechaAnterior) ||
+      (p.hora !== undefined && p.hora !== "" && p.hora !== horaAnterior);
+    actualizarReconfirmacion(sheet, rowNum, _esSi(p.reconfirmada), seMovio);
   }
 }
 
@@ -605,4 +627,77 @@ function _cellDate(val) {
     return Utilities.formatDate(val, Session.getScriptTimeZone(), "dd/MM/yyyy");
   }
   return val.toString().trim();
+}
+
+
+// ══════════════════════════════════════════════════════════════════════════
+//  RECONFIRMACIÓN DE REUNIONES (piloto Simplex)
+// ══════════════════════════════════════════════════════════════════════════
+//  El SDR marca "Reunión reconfirmada con el prospecto" en el formulario
+//  (modo Actualizar). Aquí solo se guarda en la planilla: dos columnas al final
+//  de "API Reuniones - IA" (se crean solas si faltan).
+//  Todo lo demás (alertas a SDR y líderes, estado en Células SDR y en Pulso ABM
+//  del cliente) lo hace el portal BullsEye leyendo estas columnas.
+//  Si la reunión cambia de fecha u hora, la reconfirmación se borra y hay que
+//  volver a reconfirmar con la nueva fecha.
+// ══════════════════════════════════════════════════════════════════════════
+
+const COL_RECONF       = "Reconfirmada";
+const COL_RECONF_FECHA = "Fecha reconfirmación";
+
+// ── Columnas de reconfirmación (se crean al final de la hoja si faltan) ────
+function ensureReconfColumns(sheet) {
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => h.toString().trim());
+  let next = lastCol + 1;
+  [COL_RECONF, COL_RECONF_FECHA].forEach(name => {
+    if (headers.indexOf(name) < 0) {
+      sheet.getRange(1, next).setValue(name)
+        .setBackground("#1a1b4d").setFontColor("#ffffff").setFontWeight("bold");
+      headers.push(name);
+      next++;
+    }
+  });
+  const map = {};
+  headers.forEach((h, i) => { map[h] = i + 1; }); // 1-based
+  return map;
+}
+
+// ── Guardar reconfirmación desde el formulario ────────────────────────────
+// Reconfirmada = "Sí" / "No"; Fecha reconfirmación = "dd/MM/yyyy HH:mm" (hora de
+// Chile, guardada como texto para que la planilla no la convierta).
+function actualizarReconfirmacion(sheet, rowNum, marcar, seMovio) {
+  const c     = ensureReconfColumns(sheet);
+  const celda = sheet.getRange(rowNum, c[COL_RECONF]);
+  const fecha = sheet.getRange(rowNum, c[COL_RECONF_FECHA]);
+  const yaEra = _esSi(celda.getValue());
+
+  if (!marcar || seMovio) {
+    celda.setValue("No");
+    if (yaEra || seMovio) fecha.setValue("");
+    return;
+  }
+  if (yaEra) return; // ya estaba reconfirmada: se conserva la fecha original
+
+  celda.setValue("Sí");
+  fecha.setNumberFormat("@").setValue(
+    Utilities.formatDate(new Date(), "America/Santiago", "dd/MM/yyyy HH:mm")
+  );
+}
+
+function _cellHora(val) {
+  if (!val) return "";
+  if (val instanceof Date) return Utilities.formatDate(val, Session.getScriptTimeZone(), "HH:mm");
+  return val.toString().trim();
+}
+
+function _cellFechaHora(val) {
+  if (!val) return "";
+  if (val instanceof Date) return Utilities.formatDate(val, "America/Santiago", "dd/MM/yyyy HH:mm");
+  return val.toString().trim();
+}
+
+function _esSi(v) {
+  const s = String(v === true ? "si" : (v || "")).trim().toLowerCase();
+  return s === "si" || s === "sí" || s === "true" || s === "1" || s === "yes";
 }
