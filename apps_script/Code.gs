@@ -627,39 +627,37 @@ function _cellDate(val) {
 }
 
 
+
 // ══════════════════════════════════════════════════════════════════════════
 //  RECONFIRMACIÓN DE REUNIONES
 // ══════════════════════════════════════════════════════════════════════════
 //
-//  Qué hace:
-//   1. El SDR marca "Reconfirmada" en el formulario (modo Actualizar).
-//      → Se guarda en el Sheet (columnas al final, se crean solas).
-//      → Se actualiza el contacto en HubSpot (portal BullsEye):
-//        "Reunión reconfirmada" = Sí y "Fecha reconfirmación reunión".
-//      → (Opcional) Se envía un correo de aviso al cliente.
-//   2. Un activador cada 15 min (revisarReconfirmaciones) avisa al SDR por
-//      correo cuando le toca reconfirmar, y escala al supervisor si a 1 hora
-//      de la reunión sigue sin reconfirmar.
+//  1. El SDR marca "Reunión reconfirmada" en el formulario (modo Actualizar).
+//     → Se guarda en el Sheet (4 columnas al final, se crean solas).
+//     → Se actualiza el contacto en HubSpot BullsEye (si hay HUBSPOT_TOKEN).
+//  2. Un activador cada 15 min (revisarReconfirmaciones) hace todo lo demás,
+//     solo en días hábiles de Chile y solo para clientes activos:
+//     · 08:30  Resumen diario a cada SDR y a cada líder de célula: reuniones
+//              que hay que reconfirmar hoy y antes de qué hora (+ atrasadas).
+//     · Recordatorio puntual al SDR cuando le toca reconfirmar:
+//         reunión AM (antes de 13:00 o sin hora) → día hábil anterior 16:00
+//         reunión PM (13:00 en adelante)          → mismo día 10:00
+//     · Si se cumple el plazo límite sin reconfirmar, alerta al SDR y a su líder:
+//         reunión AM → día hábil anterior 18:00 · reunión PM → mismo día 12:00
+//       (así el correo al cliente de las 18:15 cubre las AM de mañana y el
+//        de las 12:30 cubre las PM de hoy)
+//     · 12:30  Correo al cliente: reuniones de esta tarde ya reconfirmadas.
+//     · 18:15  Correo al cliente: reuniones del próximo día hábil ya reconfirmadas.
 //
-//  Regla de cuándo reconfirmar:
-//   - Reunión AM (antes de las 12:00, o sin hora): el día HÁBIL anterior,
-//     aviso a las 16:00 (fines de semana y feriados de Chile se saltan).
-//   - Reunión PM: aviso 3 horas antes, el mismo día.
+//  CONFIGURACIÓN — en el mismo Google Sheet (pestañas que se crean solas):
+//   "Reconf - Equipo"   SDR | Correo SDR | Líder de célula | Correo líder
+//   "Reconf - Clientes" Cliente | Activo (Sí/No) | Correos aviso diario | Saludo
+//  Y en Propiedades del script (solo lo secreto):
+//   HUBSPOT_TOKEN  token de app privada del portal HubSpot BullsEye
+//                  (scopes: crm.objects.contacts.read/write, crm.schemas.contacts.write)
+//   FERIADOS_EXTRA fechas extra no hábiles, "2027-01-01,2027-04-02" (opcional)
 //
-//  Configuración (Apps Script → Configuración del proyecto → Propiedades
-//  del script). Todas son opcionales salvo HUBSPOT_TOKEN para la sync:
-//   HUBSPOT_TOKEN         Token de app privada del portal HubSpot BullsEye
-//                         (scopes: crm.objects.contacts.read,
-//                          crm.objects.contacts.write, crm.schemas.contacts.write)
-//   SDR_EMAILS            JSON {"Nombre SDR tal como sale en el form":"correo"}
-//   SUPERVISOR_EMAIL      Correo(s) para escalamiento, separados por coma
-//   CLIENTES_RECONFIRMACION  Clientes a los que aplica, separados por coma
-//                         (vacío = todos). Ej: "Simplex"
-//   CLIENTE_AVISO_EMAILS  JSON {"Simplex":"correo1,correo2"} para avisar
-//                         automáticamente al cliente cuando se reconfirma
-//   FERIADOS_EXTRA        Fechas extra no hábiles, "2027-01-01,2027-04-02"
-//
-//  Instalación del activador: ejecutar UNA VEZ instalarActivadorReconfirmacion()
+//  Instalación: ejecutar UNA VEZ instalarActivadorReconfirmacion()
 // ══════════════════════════════════════════════════════════════════════════
 
 const COL_RECONF        = "Reconfirmada";
@@ -668,13 +666,24 @@ const COL_RECONF_ALERTA = "Alerta reconfirmación";
 const COL_RECONF_SYNC   = "Sync HubSpot reconfirmación";
 const RECONF_COLS       = [COL_RECONF, COL_RECONF_FECHA, COL_RECONF_ALERTA, COL_RECONF_SYNC];
 
-const RECONF_CORTE_AM_PM   = 12;   // reuniones antes de esta hora = AM
-const RECONF_HORA_AVISO_AM = 16;   // aviso el día hábil anterior a las 16:00
-const RECONF_HORAS_PM      = 3;    // reuniones PM: aviso 3 h antes
-const RECONF_HORAS_ESCALA  = 1;    // escalar al supervisor 1 h antes si sigue pendiente
-const CAL_FERIADOS_CL      = "es.cl#holiday@group.v.calendar.google.com";
+const TAB_EQUIPO   = "Reconf - Equipo";
+const TAB_CLIENTES = "Reconf - Clientes";
+const CLIENTES_PILOTO = ["Simplex"]; // se precargan como activos al crear la pestaña
 
-// Feriados de Chile ya conocidos (respaldo si el calendario de Google no responde)
+const RECONF_CORTE_AM_PM    = 13;  // reuniones antes de esta hora = AM
+const RECONF_AVISO_AM_HORA  = 16;  // AM: recordatorio el día hábil anterior 16:00
+const RECONF_LIMITE_AM_HORA = 18;  // AM: plazo límite el día hábil anterior 18:00
+const RECONF_AVISO_PM_HORA  = 10;  // PM: recordatorio el mismo día 10:00
+const RECONF_LIMITE_PM_HORA = 12;  // PM: plazo límite el mismo día 12:00
+
+// Envíos diarios [id, hora, minuto]
+const RESUMENES = [
+  ["equipo",          8, 30],
+  ["cliente_tarde",  12, 30],   // reuniones de hoy en la tarde
+  ["cliente_manana", 18, 15],   // reuniones del próximo día hábil
+];
+
+const CAL_FERIADOS_CL = "es.cl#holiday@group.v.calendar.google.com";
 const FERIADOS_CL_BASE = [
   "2026-09-18","2026-09-19","2026-10-12","2026-10-31","2026-11-01",
   "2026-12-08","2026-12-25"
@@ -682,6 +691,7 @@ const FERIADOS_CL_BASE = [
 
 const HS_PROP_RECONF       = "reunion_reconfirmada";
 const HS_PROP_RECONF_FECHA = "fecha_reconfirmacion_reunion";
+const FORM_URL = "https://bullseye-automate.github.io/Hubspot-y-SDR-Dashboard/";
 
 // ── Columnas de reconfirmación (se crean al final de la hoja si faltan) ────
 function ensureReconfColumns(sheet) {
@@ -701,6 +711,60 @@ function ensureReconfColumns(sheet) {
   return { headers: headers, col: map };
 }
 
+// ── Pestañas de configuración ───────────────────────────────────────────────
+function ensureConfigTabs(ss) {
+  let eq = ss.getSheetByName(TAB_EQUIPO);
+  if (!eq) {
+    eq = ss.insertSheet(TAB_EQUIPO);
+    const hdr = ["SDR", "Correo SDR", "Líder de célula", "Correo líder"];
+    eq.getRange(1, 1, 1, hdr.length).setValues([hdr])
+      .setBackground("#1a1b4d").setFontColor("#ffffff").setFontWeight("bold");
+    eq.setFrozenRows(1);
+    try {
+      const sdrs = getMaestraData(ss).sdrs || [];
+      if (sdrs.length) eq.getRange(2, 1, sdrs.length, 1).setValues(sdrs.map(s => [s]));
+    } catch (e) { Logger.log("No se pudo precargar SDRs: " + e); }
+    eq.setColumnWidths(1, 4, 220);
+  }
+  let cl = ss.getSheetByName(TAB_CLIENTES);
+  if (!cl) {
+    cl = ss.insertSheet(TAB_CLIENTES);
+    const hdr = ["Cliente", "Activo (Sí/No)", "Correos aviso diario (separados por coma)", "Saludo (opcional)"];
+    cl.getRange(1, 1, 1, hdr.length).setValues([hdr])
+      .setBackground("#1a1b4d").setFontColor("#ffffff").setFontWeight("bold");
+    cl.setFrozenRows(1);
+    cl.getRange(2, 1, CLIENTES_PILOTO.length, 2).setValues(CLIENTES_PILOTO.map(c => [c, "Sí"]));
+    cl.getRange(2, 2, 50, 1).setDataValidation(
+      SpreadsheetApp.newDataValidation().requireValueInList(["Sí", "No"], true).build());
+    cl.setColumnWidths(1, 4, 240);
+  }
+}
+
+function leerConfigReconf(ss) {
+  ensureConfigTabs(ss);
+  const equipo = {};   // sdr -> {correo, lider, correoLider}
+  ss.getSheetByName(TAB_EQUIPO).getDataRange().getValues().slice(1).forEach(r => {
+    const sdr = String(r[0] || "").trim();
+    if (!sdr) return;
+    equipo[sdr] = {
+      correo:      String(r[1] || "").trim(),
+      lider:       String(r[2] || "").trim(),
+      correoLider: String(r[3] || "").trim(),
+    };
+  });
+  const clientes = {}; // cliente(lower) -> {nombre, correos, saludo}
+  ss.getSheetByName(TAB_CLIENTES).getDataRange().getValues().slice(1).forEach(r => {
+    const nombre = String(r[0] || "").trim();
+    if (!nombre || !_esSi(r[1])) return;
+    clientes[nombre.toLowerCase()] = {
+      nombre:  nombre,
+      correos: String(r[2] || "").trim(),
+      saludo:  String(r[3] || "").trim(),
+    };
+  });
+  return { equipo: equipo, clientes: clientes };
+}
+
 // ── Guardar reconfirmación desde el formulario ────────────────────────────
 function actualizarReconfirmacion(sheet, rowNum, p) {
   const info   = ensureReconfColumns(sheet);
@@ -710,13 +774,11 @@ function actualizarReconfirmacion(sheet, rowNum, p) {
   const yaEra  = _esSi(get(COL_RECONF));
   const marcar = _esSi(p.reconfirmada);
 
-  // ¿Se movió la reunión? Entonces la reconfirmación y la alerta anteriores no valen.
+  // ¿Se movió la reunión? La reconfirmación y las alertas anteriores dejan de valer.
   const seMovio =
     (p.fecha_reunion !== undefined && p.fecha_reunion !== "" && p.fecha_reunion !== p._fechaAnterior) ||
     (p.hora !== undefined && p.hora !== "" && p.hora !== p._horaAnterior);
-  if (seMovio) {
-    sheet.getRange(rowNum, c[COL_RECONF_ALERTA]).setValue("");
-  }
+  if (seMovio) sheet.getRange(rowNum, c[COL_RECONF_ALERTA]).setValue("");
 
   sheet.getRange(rowNum, c[COL_RECONF]).setValue(marcar ? "Sí" : "No");
 
@@ -724,34 +786,22 @@ function actualizarReconfirmacion(sheet, rowNum, p) {
     if (yaEra || seMovio) sheet.getRange(rowNum, c[COL_RECONF_FECHA]).setValue("");
     return;
   }
-  if (yaEra && !seMovio) return; // ya estaba reconfirmada: no repetir avisos
+  if (yaEra && !seMovio) return;
 
   const ahora = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm");
   sheet.getRange(rowNum, c[COL_RECONF_FECHA]).setValue(ahora);
 
-  // Datos de la reunión para HubSpot / aviso al cliente
-  const headersL = info.headers.map(h => h.toLowerCase());
-  const val = (pred) => { const i = headersL.findIndex(pred); return i >= 0 ? row[i] : ""; };
-  const reunion = {
-    cliente:  String(val(h => h === "cliente") || ""),
-    empresa:  String(val(h => h.includes("empresa")) || ""),
-    contacto: String(val(h => h.includes("contacto") && !h.includes("linkedin") && !h.includes("empresa")) || ""),
-    cargo:    String(val(h => h === "cargo") || ""),
-    correo:   String(val(h => h === "correo") || "").trim(),
-    sdr:      String(val(h => h.includes("responsable")) || ""),
-    fecha:    p.fecha_reunion || _cellDate(val(h => h.includes("fecha") && h.includes("reuni"))),
-    hora:     p.hora || _cellHora(val(h => h === "hora")),
-  };
+  const r = _reunionDeFila(info.headers, row);
+  if (p.fecha_reunion) r.fecha = p.fecha_reunion;
+  if (p.hora) r.hora = p.hora;
 
   let sync;
   try {
-    sync = syncReconfirmacionHubSpot(reunion);
+    sync = syncReconfirmacionHubSpot(r);
   } catch (err) {
     sync = "Error: " + err.message;
   }
   sheet.getRange(rowNum, c[COL_RECONF_SYNC]).setValue(sync + " (" + ahora + ")");
-
-  try { avisarClienteReconfirmacion(reunion); } catch (err) { Logger.log("Aviso cliente: " + err); }
 }
 
 // ── HubSpot (portal BullsEye) ─────────────────────────────────────────────
@@ -773,16 +823,13 @@ function syncReconfirmacionHubSpot(r) {
 }
 
 function buscarContactoHubSpot(token, r) {
-  // 1) Por correo (lo más confiable)
   if (r.correo && r.correo.indexOf("@") > 0) {
-    const res = _hs(token, "post", "/crm/v3/objects/contacts/search", {
+    const json = _json(_hs(token, "post", "/crm/v3/objects/contacts/search", {
       filterGroups: [{ filters: [{ propertyName: "email", operator: "EQ", value: r.correo.toLowerCase() }] }],
       limit: 2
-    });
-    const json = _json(res);
+    }));
     if (json && json.results && json.results.length) return json.results[0].id;
   }
-  // 2) Por nombre del contacto dentro del cliente BullsEye (solo si hay UN resultado)
   if (r.contacto) {
     const body = { query: r.contacto, limit: 5, properties: ["company"] };
     if (r.cliente) {
@@ -801,7 +848,6 @@ function buscarContactoHubSpot(token, r) {
   return null;
 }
 
-// Crea las propiedades de contacto si no existen (una sola vez)
 function ensureHubSpotReconfProps(token) {
   const props = PropertiesService.getScriptProperties();
   if (props.getProperty("HS_RECONF_PROPS_OK") === "1") return;
@@ -838,144 +884,343 @@ function _json(res) {
   try { return res.code < 300 ? JSON.parse(res.body) : null; } catch (e) { return null; }
 }
 
-// ── Aviso automático al cliente (correo, opcional) ─────────────────────────
-function avisarClienteReconfirmacion(r) {
-  const destinos = _jsonProp("CLIENTE_AVISO_EMAILS")[r.cliente];
-  if (!destinos) return;
-  const asunto = "✅ Reunión reconfirmada: " + r.empresa + " — " + r.fecha + (r.hora ? " " + r.hora : "");
-  const cuerpo = [
-    "Hola,",
-    "",
-    "Te confirmamos que la siguiente reunión fue reconfirmada con el prospecto:",
-    "",
-    "🏢 Empresa: " + (r.empresa || "-"),
-    "👤 Contacto: " + (r.contacto || "-") + (r.cargo ? " (" + r.cargo + ")" : ""),
-    "📅 Fecha: " + (r.fecha || "-") + (r.hora ? " — " + r.hora + " hrs" : ""),
-    "🧑‍💼 SDR: " + (r.sdr || "-"),
-    "",
-    "Equipo BullsEye",
-  ].join("\n");
-  MailApp.sendEmail(destinos, asunto, cuerpo, { name: "BullsEye — Reuniones" });
-}
-
-// ── Recordatorios y escalamiento (activador cada 15 min) ────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+//  ACTIVADOR CADA 15 MIN
+// ══════════════════════════════════════════════════════════════════════════
 function revisarReconfirmaciones() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(20000)) return;
   try {
-    const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(OUTPUT_TAB);
-    if (!sheet || sheet.getLastRow() < 2) return;
-
-    const info     = ensureReconfColumns(sheet);
-    const c        = info.col;
-    const headersL = info.headers.map(h => h.toLowerCase());
-    const idx      = (pred) => headersL.findIndex(pred);
-    const iCliente  = idx(h => h === "cliente");
-    const iSdr      = idx(h => h.includes("responsable"));
-    const iEmpresa  = idx(h => h.includes("empresa"));
-    const iContacto = idx(h => h.includes("contacto") && !h.includes("linkedin") && !h.includes("empresa"));
-    const iFecha    = idx(h => h.includes("fecha") && h.includes("reuni"));
-    const iHora     = idx(h => h === "hora");
-    const iEstado   = idx(h => h === "realizado");
-
-    const props       = PropertiesService.getScriptProperties();
-    const sdrEmails   = _jsonProp("SDR_EMAILS");
-    const supervisor  = props.getProperty("SUPERVISOR_EMAIL") || "";
-    const soloClientes = (props.getProperty("CLIENTES_RECONFIRMACION") || "")
-      .split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
-
-    const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, info.headers.length).getValues();
-    const now    = new Date();
-    const tz     = Session.getScriptTimeZone();
-    const avisosSdr = {};   // sdr -> [lineas]
-    const escalados = [];   // lineas
-
-    values.forEach((r, k) => {
-      const rowNum = k + 2;
-      const estado = String(r[iEstado] || "").trim().toLowerCase();
-      if (estado !== "" && estado !== "pendiente") return;           // ya realizada / caída
-      if (_esSi(r[c[COL_RECONF] - 1])) return;                         // ya reconfirmada
-      const cliente = String(r[iCliente] || "").trim();
-      if (soloClientes.length && soloClientes.indexOf(cliente.toLowerCase()) < 0) return;
-
-      const inicio = _fechaHoraReunion(r[iFecha], r[iHora]);
-      if (!inicio || inicio <= now) return;
-
-      const plazo   = _momentoAvisoReconf(inicio, r[iHora]);
-      const escala  = new Date(inicio.getTime() - RECONF_HORAS_ESCALA * 3600 * 1000);
-      const alerta  = String(r[c[COL_RECONF_ALERTA] - 1] || "");
-      const sdr     = String(r[iSdr] || "").trim();
-      const linea   = "• " + cliente + " | " + (r[iEmpresa] || "-") + " — " + (r[iContacto] || "-") +
-                      " | " + Utilities.formatDate(inicio, tz, "EEE dd/MM HH:mm") + " hrs";
-      const stamp   = Utilities.formatDate(now, tz, "dd/MM HH:mm");
-
-      if (now >= escala && alerta.indexOf("Escalada") !== 0) {
-        escalados.push(linea + " | SDR: " + sdr);
-        (avisosSdr[sdr] = avisosSdr[sdr] || []).push(linea + "  ⚠️ URGENTE (falta 1 hora)");
-        sheet.getRange(rowNum, c[COL_RECONF_ALERTA]).setValue("Escalada " + stamp);
-      } else if (now >= plazo && alerta === "") {
-        (avisosSdr[sdr] = avisosSdr[sdr] || []).push(linea);
-        sheet.getRange(rowNum, c[COL_RECONF_ALERTA]).setValue("Recordatorio " + stamp);
-      }
-    });
-
-    Object.keys(avisosSdr).forEach(sdr => {
-      const email = sdrEmails[sdr];
-      if (!email) { Logger.log("Sin correo para SDR: " + sdr); return; }
-      MailApp.sendEmail(email,
-        "⏰ Reconfirma tus reuniones (" + avisosSdr[sdr].length + ")",
-        "Hola " + sdr + ",\n\nEstas reuniones necesitan reconfirmación con el prospecto:\n\n" +
-        avisosSdr[sdr].join("\n") +
-        "\n\nCuando reconfirmes, márcala como ✅ Reconfirmada en el formulario (Actualizar reunión):\n" +
-        "https://bullseye-automate.github.io/Hubspot-y-SDR-Dashboard/\n\nAsí el cliente queda notificado.",
-        { name: "BullsEye — Reuniones" });
-    });
-
-    if (escalados.length && supervisor) {
-      MailApp.sendEmail(supervisor,
-        "🚨 Reuniones sin reconfirmar a 1 hora (" + escalados.length + ")",
-        "Estas reuniones siguen sin reconfirmar y empiezan en menos de 1 hora:\n\n" + escalados.join("\n"),
-        { name: "BullsEye — Reuniones" });
-    }
+    const now = new Date();
+    const ss  = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const ctx = _contextoReconf(ss, now);
+    if (!ctx) return;
+    _alertasPuntuales(ctx);
+    if (_esHabil(now)) _resumenesDiarios(ctx);
+    _avisosClienteRezagados(ctx);
   } finally {
     lock.releaseLock();
   }
 }
 
-// Ejecutar UNA VEZ a mano para instalar el activador cada 15 minutos
+// Lee la hoja y arma la lista de reuniones pendientes de clientes activos
+function _contextoReconf(ss, now) {
+  const sheet = ss.getSheetByName(OUTPUT_TAB);
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  const info = ensureReconfColumns(sheet);
+  const cfg  = leerConfigReconf(ss);
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, info.headers.length).getValues();
+
+  const reuniones = [];
+  values.forEach((row, k) => {
+    const r = _reunionDeFila(info.headers, row);
+    const estado = r.estado.toLowerCase();
+    if (estado !== "" && estado !== "pendiente") return;           // realizada / caída / reagendar
+    const cli = cfg.clientes[r.cliente.toLowerCase()];
+    if (!cli) return;                                                // cliente no activo
+    r.inicio = _fechaHoraReunion(r.fechaCell, r.horaCell);
+    if (!r.inicio) return;
+    r.rowNum = k + 2;
+    r.plazos = _plazosReconf(r.inicio, r.horaCell);
+    reuniones.push(r);
+  });
+  return { ss: ss, sheet: sheet, info: info, cfg: cfg, now: now, reuniones: reuniones,
+           tz: Session.getScriptTimeZone() };
+}
+
+// ── Recordatorio puntual y alerta de plazo vencido ─────────────────────────
+function _alertasPuntuales(ctx) {
+  const { sheet, info, cfg, now, tz } = ctx;
+  const colAlerta = info.col[COL_RECONF_ALERTA];
+  const porSdr = {}, porLider = {};
+  const stamp = Utilities.formatDate(now, tz, "dd/MM HH:mm");
+
+  ctx.reuniones.forEach(r => {
+    if (r.reconfirmada || r.inicio <= now) return;
+    const eq = cfg.equipo[r.sdr] || {};
+    if (now >= r.plazos.limite && r.alerta.indexOf("Vencida") !== 0) {
+      _push(porSdr, r.sdr, r, "vencida");
+      if (eq.correoLider) _push(porLider, eq.correoLider, r, "vencida");
+      sheet.getRange(r.rowNum, colAlerta).setValue("Vencida " + stamp);
+    } else if (now >= r.plazos.aviso && now < r.plazos.limite && r.alerta === "") {
+      _push(porSdr, r.sdr, r, "aviso");
+      sheet.getRange(r.rowNum, colAlerta).setValue("Recordatorio " + stamp);
+    }
+  });
+
+  Object.keys(porSdr).forEach(sdr => {
+    const correo = (cfg.equipo[sdr] || {}).correo;
+    if (!correo) { Logger.log("Sin correo para SDR: " + sdr); return; }
+    const items  = porSdr[sdr];
+    const vencen = items.filter(x => x.tipo === "vencida").length;
+    _enviar(correo,
+      vencen ? "🚨 Reuniones sin reconfirmar — plazo vencido (" + vencen + ")"
+             : "⏰ Te toca reconfirmar (" + items.length + ")",
+      "Hola " + _primerNombre(sdr) + ",",
+      vencen ? "Estas reuniones pasaron su plazo de reconfirmación. Reconfírmalas ahora:"
+             : "Es momento de reconfirmar estas reuniones con el prospecto:",
+      items.map(x => x.r), ctx, { sdr: false },
+      "Cuando reconfirmes, márcala en el formulario (Actualizar reunión): " + FORM_URL);
+  });
+
+  Object.keys(porLider).forEach(correo => {
+    _enviar(correo,
+      "🚨 Reuniones de tu equipo sin reconfirmar (" + porLider[correo].length + ")",
+      "Hola,",
+      "Estas reuniones pasaron su plazo de reconfirmación y siguen pendientes:",
+      porLider[correo].map(x => x.r), ctx, { sdr: true }, "");
+  });
+}
+
+// ── Resúmenes diarios (una vez por día y por envío) ─────────────────────────
+function _resumenesDiarios(ctx) {
+  const props = PropertiesService.getScriptProperties();
+  const hoy   = Utilities.formatDate(ctx.now, ctx.tz, "yyyy-MM-dd");
+  RESUMENES.forEach(([id, hh, mm]) => {
+    const desde = new Date(ctx.now); desde.setHours(hh, mm, 0, 0);
+    const hasta = new Date(desde.getTime() + 3 * 3600 * 1000);
+    const flag  = "RESUMEN_" + id + "_" + hoy;
+    if (ctx.now < desde || ctx.now >= hasta || props.getProperty(flag)) return;
+    props.setProperty(flag, "1");
+    if (id === "equipo")         { _resumenEquipo(ctx); _limpiarMarcasAntiguas(ctx.now); }
+    if (id === "cliente_tarde")  _resumenCliente(ctx, "tarde");
+    if (id === "cliente_manana") _resumenCliente(ctx, "manana");
+  });
+}
+
+// 08:30 — a cada SDR y a cada líder: qué reconfirmar hoy y antes de qué hora
+function _resumenEquipo(ctx) {
+  const { cfg, now } = ctx;
+  const finHoy = new Date(now); finHoy.setHours(23, 59, 59, 999);
+  const lista = ctx.reuniones
+    .filter(r => !r.reconfirmada && r.inicio > now && r.plazos.limite <= finHoy)
+    .sort((a, b) => a.plazos.limite - b.plazos.limite);
+
+  const porSdr = {}, porLider = {};
+  lista.forEach(r => {
+    (porSdr[r.sdr] = porSdr[r.sdr] || []).push(r);
+    const eq = cfg.equipo[r.sdr] || {};
+    if (eq.correoLider) {
+      const k = eq.correoLider;
+      (porLider[k] = porLider[k] || { nombre: eq.lider, items: [] }).items.push(r);
+    }
+  });
+
+  Object.keys(porSdr).forEach(sdr => {
+    const correo = (cfg.equipo[sdr] || {}).correo;
+    if (!correo) { Logger.log("Sin correo para SDR: " + sdr); return; }
+    _enviar(correo, "📋 Reuniones para reconfirmar hoy (" + porSdr[sdr].length + ")",
+      "Hola " + _primerNombre(sdr) + ",",
+      "Estas son las reuniones que debes reconfirmar hoy, ordenadas por plazo:",
+      porSdr[sdr], ctx, { sdr: false },
+      "Al reconfirmar, márcala en el formulario (Actualizar reunión): " + FORM_URL);
+  });
+
+  Object.keys(porLider).forEach(correo => {
+    const g = porLider[correo];
+    _enviar(correo, "📋 Reconfirmaciones de tu célula hoy (" + g.items.length + ")",
+      "Hola " + _primerNombre(g.nombre) + ",",
+      "Estas son las reuniones que tu equipo debe reconfirmar hoy, ordenadas por plazo:",
+      g.items, ctx, { sdr: true }, "");
+  });
+}
+
+// 12:30 / 18:15 — al cliente: reuniones ya reconfirmadas
+function _resumenCliente(ctx, cual) {
+  const { cfg, now, tz } = ctx;
+  let dia, titulo, intro;
+  if (cual === "tarde") {
+    dia    = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    titulo = "Reuniones reconfirmadas para esta tarde";
+    intro  = "Te confirmamos que estas reuniones de hoy en la tarde ya fueron reconfirmadas con el prospecto:";
+  } else {
+    dia    = _diaHabilSiguiente(now);
+    titulo = "Reuniones reconfirmadas para el " + Utilities.formatDate(dia, tz, "dd/MM");
+    intro  = "Te confirmamos que estas reuniones del " + _nombreDia(dia) + " ya fueron reconfirmadas con el prospecto:";
+  }
+  const mismoDia = (d) => d.getFullYear() === dia.getFullYear() && d.getMonth() === dia.getMonth() && d.getDate() === dia.getDate();
+
+  Object.keys(cfg.clientes).forEach(k => {
+    const cli = cfg.clientes[k];
+    if (!cli.correos) return;
+    let delDia = ctx.reuniones.filter(r => r.cliente.toLowerCase() === k && mismoDia(r.inicio) && r.inicio > now);
+    if (cual === "tarde") delDia = delDia.filter(r => r.inicio.getHours() >= RECONF_CORTE_AM_PM);
+    const ok = delDia.filter(r => r.reconfirmada).sort((a, b) => a.inicio - b.inicio);
+    if (!ok.length) return;
+    const pendientes = delDia.length - ok.length;
+    ok.forEach(r => _marcarAvisoCliente(r));
+    const nota = cual === "manana"
+      ? "Las reuniones de la tarde se reconfirman el mismo día; te avisaremos a las 12:30."
+      : "";
+    _enviar(cli.correos, "✅ " + titulo + " — " + cli.nombre,
+      cli.saludo || "Hola,",
+      intro, ok, ctx, { sdr: true, cliente: true },
+      (pendientes ? pendientes + (pendientes === 1 ? " reunión más está" : " reuniones más están") +
+        " en proceso de reconfirmación. " : "") + nota);
+  });
+}
+
+// Reconfirmaciones que llegan DESPUÉS del correo diario (12:30 / 18:15):
+// se avisan al cliente en la siguiente pasada (≤15 min), una por una.
+function _avisosClienteRezagados(ctx) {
+  const { cfg, now, tz } = ctx;
+  ctx.reuniones.forEach(r => {
+    if (!r.reconfirmada || r.inicio <= now || _yaAvisadoCliente(r)) return;
+    const cli = cfg.clientes[r.cliente.toLowerCase()];
+    if (!cli || !cli.correos) return;
+    // ¿Ya pasó el correo diario que debía incluirla?
+    let resumen;
+    if (r.inicio.getHours() >= RECONF_CORTE_AM_PM) {
+      resumen = new Date(r.inicio); resumen.setHours(12, 30, 0, 0);
+    } else {
+      resumen = _diaHabilAnterior(r.inicio); resumen.setHours(18, 15, 0, 0);
+    }
+    if (now < resumen) return;
+    _enviar(cli.correos, "✅ Reunión reconfirmada: " + r.empresa + " — " +
+        Utilities.formatDate(r.inicio, tz, "dd/MM HH:mm") + " hrs",
+      cli.saludo || "Hola,",
+      "Te confirmamos que esta reunión ya fue reconfirmada con el prospecto:",
+      [r], ctx, { sdr: true, cliente: true }, "");
+    _marcarAvisoCliente(r);
+  });
+}
+
+function _claveAvisoCliente(r) {
+  return "AVCLI_" + r.rowNum + "_" + Utilities.formatDate(r.inicio, Session.getScriptTimeZone(), "yyyyMMddHHmm");
+}
+function _yaAvisadoCliente(r) {
+  return !!PropertiesService.getScriptProperties().getProperty(_claveAvisoCliente(r));
+}
+function _marcarAvisoCliente(r) {
+  PropertiesService.getScriptProperties().setProperty(_claveAvisoCliente(r), "1");
+}
+
+// Borra marcas de avisos/resúmenes de más de 14 días (se llama en el resumen de las 08:30)
+function _limpiarMarcasAntiguas(now) {
+  const props = PropertiesService.getScriptProperties();
+  const corte = new Date(now); corte.setDate(corte.getDate() - 14);
+  const lim   = Utilities.formatDate(corte, Session.getScriptTimeZone(), "yyyyMMdd");
+  Object.keys(props.getProperties()).forEach(k => {
+    let m = k.match(/^AVCLI_\d+_(\d{8})/) || k.match(/^RESUMEN_.+_(\d{4})-(\d{2})-(\d{2})$/);
+    if (!m) return;
+    const f = m.length === 2 ? m[1] : m[1] + m[2] + m[3];
+    if (f < lim) props.deleteProperty(k);
+  });
+}
+
+// ── Correo HTML con tabla de reuniones ─────────────────────────────────────
+function _enviar(destinos, asunto, saludo, intro, reuniones, ctx, opt, pie) {
+  const tz  = ctx.tz;
+  const th  = 'style="text-align:left;padding:8px 10px;background:#1a1b4d;color:#fff;font-size:13px"';
+  const td  = 'style="padding:8px 10px;border-bottom:1px solid #e3e5ef;font-size:13px;vertical-align:top"';
+  const filas = reuniones.map(r => {
+    const reunion = Utilities.formatDate(r.inicio, tz, "EEE dd/MM HH:mm") + " hrs";
+    const plazo   = opt.cliente ? "" :
+      "<td " + td + "><b>" + Utilities.formatDate(r.plazos.limite, tz, "EEE dd/MM HH:mm") + "</b>" +
+      (ctx.now >= r.plazos.limite ? ' <span style="color:#d32f2f">(vencido)</span>' : "") + "</td>";
+    return "<tr>" +
+      "<td " + td + "><b>" + _esc(r.empresa) + "</b>" + (opt.cliente ? "" : "<br><span style='color:#667'>" + _esc(r.cliente) + "</span>") + "</td>" +
+      "<td " + td + ">" + _esc(r.contacto) + (r.cargo ? "<br><span style='color:#667'>" + _esc(r.cargo) + "</span>" : "") + "</td>" +
+      "<td " + td + ">" + reunion + "</td>" +
+      plazo +
+      (opt.sdr ? "<td " + td + ">" + _esc(r.sdr) + "</td>" : "") +
+      "</tr>";
+  }).join("");
+  const head = "<tr><th " + th + ">Empresa</th><th " + th + ">Contacto</th><th " + th + ">Reunión</th>" +
+    (opt.cliente ? "" : "<th " + th + ">Reconfirmar antes de</th>") +
+    (opt.sdr ? "<th " + th + ">SDR</th>" : "") + "</tr>";
+  const html =
+    '<div style="font-family:Arial,Helvetica,sans-serif;color:#1d1f33;max-width:720px">' +
+    "<p>" + _esc(saludo) + "</p><p>" + _esc(intro) + "</p>" +
+    '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%">' + head + filas + "</table>" +
+    (pie ? '<p style="color:#555;font-size:13px">' + _esc(pie) + "</p>" : "") +
+    '<p style="color:#888;font-size:12px">Equipo BullsEye</p></div>';
+  const texto = saludo + "\n\n" + intro + "\n\n" + reuniones.map(r =>
+    "• " + r.empresa + " — " + r.contacto + " | " + Utilities.formatDate(r.inicio, tz, "EEE dd/MM HH:mm") +
+    (opt.cliente ? "" : " | reconfirmar antes de " + Utilities.formatDate(r.plazos.limite, tz, "dd/MM HH:mm")) +
+    (opt.sdr ? " | SDR: " + r.sdr : "")).join("\n") + (pie ? "\n\n" + pie : "");
+  MailApp.sendEmail(destinos, asunto, texto, { htmlBody: html, name: "BullsEye — Reuniones" });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  INSTALACIÓN Y PRUEBAS
+// ══════════════════════════════════════════════════════════════════════════
+
+// Ejecutar UNA VEZ: crea pestañas de configuración, columnas y el activador
 function instalarActivadorReconfirmacion() {
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === "revisarReconfirmaciones")
     .forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger("revisarReconfirmaciones").timeBased().everyMinutes(15).create();
-  ensureReconfColumns(SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(OUTPUT_TAB));
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  ensureReconfColumns(ss.getSheetByName(OUTPUT_TAB));
+  ensureConfigTabs(ss);
 }
 
-// Prueba manual: muestra en el registro qué avisaría ahora, sin enviar nada
-function probarReglasReconfirmacion() {
-  const casos = [["13/11/2026", "09:30"], ["16/11/2026", "10:00"], ["13/11/2026", "15:00"], ["08/12/2026", "11:00"], ["09/12/2026", "10:00"]];
-  const tz = Session.getScriptTimeZone();
-  casos.forEach(([f, h]) => {
-    const ini = _fechaHoraReunion(f, h);
-    Logger.log(f + " " + h + " → avisar " + Utilities.formatDate(_momentoAvisoReconf(ini, h), tz, "EEE dd/MM HH:mm"));
-  });
+// Muestra en el registro qué se enviaría ahora, SIN enviar ni marcar nada
+function simularReconfirmaciones() {
+  const ctx = _contextoReconf(SpreadsheetApp.openById(SPREADSHEET_ID), new Date());
+  if (!ctx) { Logger.log("Sin reuniones"); return; }
+  ctx.reuniones.forEach(r => Logger.log([
+    r.cliente, r.empresa, r.sdr,
+    "reunión " + Utilities.formatDate(r.inicio, ctx.tz, "dd/MM HH:mm"),
+    "aviso " + Utilities.formatDate(r.plazos.aviso, ctx.tz, "dd/MM HH:mm"),
+    "límite " + Utilities.formatDate(r.plazos.limite, ctx.tz, "dd/MM HH:mm"),
+    r.reconfirmada ? "RECONFIRMADA" : "pendiente",
+  ].join(" | ")));
 }
 
-// ── Helpers de fecha ───────────────────────────────────────────────────────
-function _momentoAvisoReconf(inicio, horaCell) {
+// ══════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ══════════════════════════════════════════════════════════════════════════
+function _reunionDeFila(headers, row) {
+  const hl  = headers.map(h => String(h).trim().toLowerCase());
+  const at  = (pred) => { const i = hl.findIndex(pred); return i >= 0 ? row[i] : ""; };
+  const str = (v) => String(v === null || v === undefined ? "" : v).trim();
+  const iR  = hl.indexOf(COL_RECONF.toLowerCase());
+  const iA  = hl.indexOf(COL_RECONF_ALERTA.toLowerCase());
+  return {
+    cliente:   str(at(h => h === "cliente")),
+    sdr:       str(at(h => h.includes("responsable"))),
+    empresa:   str(at(h => h.includes("empresa"))),
+    contacto:  str(at(h => h.includes("contacto") && !h.includes("linkedin") && !h.includes("empresa"))),
+    cargo:     str(at(h => h === "cargo")),
+    correo:    str(at(h => h === "correo")),
+    estado:    str(at(h => h === "realizado")),
+    fechaCell: at(h => h.includes("fecha") && h.includes("reuni")),
+    horaCell:  at(h => h === "hora"),
+    fecha:     _cellDate(at(h => h.includes("fecha") && h.includes("reuni"))),
+    hora:      _cellHora(at(h => h === "hora")),
+    reconfirmada: iR >= 0 ? _esSi(row[iR]) : false,
+    alerta:    iA >= 0 ? str(row[iA]) : "",
+  };
+}
+
+function _push(obj, key, r, tipo) { (obj[key] = obj[key] || []).push({ r: r, tipo: tipo }); }
+
+// aviso = cuándo recordarle al SDR; limite = plazo para reconfirmar
+function _plazosReconf(inicio, horaCell) {
   const hh = _horaNum(horaCell);
   if (hh === null || hh < RECONF_CORTE_AM_PM) {
     const d = _diaHabilAnterior(inicio);
-    d.setHours(RECONF_HORA_AVISO_AM, 0, 0, 0);
-    return d;
+    const aviso  = new Date(d); aviso.setHours(RECONF_AVISO_AM_HORA, 0, 0, 0);
+    const limite = new Date(d); limite.setHours(RECONF_LIMITE_AM_HORA, 0, 0, 0);
+    return { aviso: aviso, limite: limite };
   }
-  return new Date(inicio.getTime() - RECONF_HORAS_PM * 3600 * 1000);
+  const aviso  = new Date(inicio); aviso.setHours(RECONF_AVISO_PM_HORA, 0, 0, 0);
+  const limite = new Date(inicio); limite.setHours(RECONF_LIMITE_PM_HORA, 0, 0, 0);
+  return { aviso: aviso, limite: limite };
 }
 
 function _diaHabilAnterior(fecha) {
   const d = new Date(fecha.getFullYear(), fecha.getMonth(), fecha.getDate());
   do { d.setDate(d.getDate() - 1); } while (!_esHabil(d));
+  return d;
+}
+
+function _diaHabilSiguiente(fecha) {
+  const d = new Date(fecha.getFullYear(), fecha.getMonth(), fecha.getDate());
+  do { d.setDate(d.getDate() + 1); } while (!_esHabil(d));
   return d;
 }
 
@@ -1017,8 +1262,7 @@ function _fechaHoraReunion(fechaCell, horaCell) {
     d = new Date(+m[3], +m[2] - 1, +m[1]);
   }
   const hh = _horaNum(horaCell);
-  const mm = _minNum(horaCell);
-  d.setHours(hh === null ? 9 : hh, mm, 0, 0); // sin hora: se asume 09:00 (AM)
+  d.setHours(hh === null ? 9 : hh, _minNum(horaCell), 0, 0); // sin hora: se asume 09:00 (AM)
   return d;
 }
 
@@ -1038,12 +1282,15 @@ function _cellHora(val) {
   return val.toString().trim();
 }
 
+function _nombreDia(d) {
+  return ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"][d.getDay()] +
+    " " + String(d.getDate()).padStart(2, "0") + "/" + String(d.getMonth() + 1).padStart(2, "0");
+}
+function _primerNombre(n) { return String(n || "").trim().split(/\s+/)[0] || ""; }
+function _esc(s) {
+  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 function _esSi(v) {
   const s = String(v === true ? "si" : (v || "")).trim().toLowerCase();
   return s === "si" || s === "sí" || s === "true" || s === "1" || s === "yes";
-}
-
-function _jsonProp(name) {
-  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(name) || "{}"); }
-  catch (e) { Logger.log("Propiedad " + name + " no es JSON válido"); return {}; }
 }

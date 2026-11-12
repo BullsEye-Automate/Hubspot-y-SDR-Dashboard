@@ -1106,8 +1106,9 @@ async function updateMeeting(idx, rowNum) {
 }
 
 // ── Reconfirmación: plazo, badge y aviso para el cliente ──────────────────
-// Misma regla que el Apps Script: reunión AM (o sin hora) → día hábil anterior
-// a las 16:00; reunión PM → 3 horas antes.
+// Misma regla que el Apps Script: reunión AM (antes de 13:00 o sin hora) →
+// reconfirmar el día hábil anterior entre 16:00 y 18:00; reunión PM → el mismo
+// día entre 10:00 y 12:00.
 const FERIADOS_CL = ["2026-09-18","2026-09-19","2026-10-12","2026-10-31","2026-11-01","2026-12-08","2026-12-25"];
 
 function parseFechaHora(fecha, hora) {
@@ -1121,7 +1122,10 @@ function plazoReconf(m) {
   const inicio = parseFechaHora(m.fecha, m.hora);
   if (!inicio) return null;
   const h = String(m.hora || "").match(/^(\d{1,2}):/);
-  if (h && +h[1] >= 12) return new Date(inicio.getTime() - 3 * 3600 * 1000);
+  if (h && +h[1] >= 13) {
+    const d = new Date(inicio); d.setHours(10, 0, 0, 0);
+    return d;
+  }
   const d = new Date(inicio.getFullYear(), inicio.getMonth(), inicio.getDate());
   const iso = (x) => `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,"0")}-${String(x.getDate()).padStart(2,"0")}`;
   do { d.setDate(d.getDate() - 1); } while ([0, 6].includes(d.getDay()) || FERIADOS_CL.includes(iso(d)));
@@ -1136,11 +1140,14 @@ function reconfBadge(m) {
   const plazo  = plazoReconf(m);
   const inicio = parseFechaHora(m.fecha, m.hora);
   if (!plazo || !inicio) return `<span class="reconf-badge">Sin fecha para calcular plazo</span>`;
-  const now = new Date();
-  const fmt = plazo.toLocaleString("es-CL", { weekday: "short", day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
-  if (inicio <= now) return `<span class="reconf-badge">Reunión ya pasó</span>`;
-  if (now >= plazo)  return `<span class="reconf-badge late">⏰ Reconfirmar YA (desde ${fmt})</span>`;
-  return `<span class="reconf-badge due">⏳ Reconfirmar desde ${fmt}</span>`;
+  const now    = new Date();
+  const limite = new Date(plazo.getTime() + 2 * 3600 * 1000); // ventana de 2 h
+  const dia    = plazo.toLocaleDateString("es-CL", { weekday: "short", day: "2-digit", month: "2-digit" });
+  const hhmm   = (d) => `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+  if (inicio <= now)  return `<span class="reconf-badge">Reunión ya pasó</span>`;
+  if (now >= limite)  return `<span class="reconf-badge late">🚨 Plazo vencido (${dia} ${hhmm(limite)}) — reconfirmar YA</span>`;
+  if (now >= plazo)   return `<span class="reconf-badge late">⏰ Reconfirmar ahora, antes de las ${hhmm(limite)}</span>`;
+  return `<span class="reconf-badge due">⏳ Reconfirmar el ${dia} entre ${hhmm(plazo)} y ${hhmm(limite)}</span>`;
 }
 
 function reconfMessage(m) {
